@@ -278,7 +278,7 @@ impl LiquifyField {
 
     /// The field nodes a dab of radius `r` at `c` can touch, as `(i0, j0, i1, j1)` inclusive;
     /// `None` when it touches none (off the grid, or a NaN centre).
-    fn node_span(&self, c: [f64; 2], r: f64) -> Option<(usize, usize, usize, usize)> {
+    pub(crate) fn node_span(&self, c: [f64; 2], r: f64) -> Option<(usize, usize, usize, usize)> {
         let (gx0, gy0) = self.to_grid(c[0] - r, c[1] - r);
         let (gx1, gy1) = self.to_grid(c[0] + r, c[1] + r);
         // Decide the overlap in f64, before any conversion to an index: a far-off centre saturated

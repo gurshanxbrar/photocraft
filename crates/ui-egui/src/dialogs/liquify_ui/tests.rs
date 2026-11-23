@@ -1385,3 +1385,69 @@ fn the_preview_on_a_smart_object_follows_its_filter_mask() {
     }
     assert!(masked > 0 && shown_changed > 0, "masked {masked}, changed inside the mask {shown_changed}");
 }
+
+/// Face slider changes undo and redo (Ctrl+Z / Ctrl+Shift+Z) in order with brush strokes, a drag
+/// being one step, and the field always matches what OK would replay.
+#[test]
+fn face_slider_changes_undo_and_redo_in_order_with_strokes() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_layer();
+    open(&mut app, &ctx).unwrap();
+    control(&mut app, &json!({"tool": "forwardWarp", "size": 30})).unwrap();
+    let face = FaceEdit {
+        face: FaceShape { rect: [30.0, 10.0, 60.0, 64.0], landmarks: [[48.0, 30.0], [72.0, 30.0], [60.0, 42.0], [52.0, 55.0], [68.0, 55.0]] },
+        sliders: FaceSliders::default(),
+    };
+    let slide = |app: &mut PhotocraftApp, values: &[f64]| {
+        let d = app.distort.liquify.as_mut().unwrap();
+        // A drag: several values while the pointer is down, then release.
+        for &v in values {
+            let before = d.faces.clone();
+            d.faces[0].sliders.face_width = v;
+            d.face_change_from.get_or_insert(before);
+            d.faces_changed();
+        }
+        d.finish_face_change();
+    };
+    let expected = |d: &LiquifyDialog| photocraft_engine::distort_cmds::liquify_field(d.canvas, d.cell, &d.strokes, &d.faces);
+    app.distort.liquify.as_mut().unwrap().faces = vec![face];
+
+    slide(&mut app, &[-10.0, -30.0, -50.0]);
+    for ev in [ToolEvent::Down { x: 40.0, y: 40.0, pressure: 1.0 }, ToolEvent::Move { x: 54.0, y: 40.0, pressure: 1.0 }, ToolEvent::Up { x: 54.0, y: 40.0 }] {
+        pointer(&mut app, ev, egui::Modifiers::NONE);
+    }
+    slide(&mut app, &[20.0]);
+    let d = app.distort.liquify.as_ref().unwrap();
+    assert_eq!((d.face_undo.len(), d.strokes.len()), (2, 1), "the drag is one step");
+    assert_eq!(d.field, expected(d));
+
+    // Undo: the last slider change, then the stroke, then the drag (all the way back to 0).
+    control(&mut app, &json!({"undo": true})).unwrap();
+    let d = app.distort.liquify.as_ref().unwrap();
+    assert_eq!((d.faces[0].sliders.face_width, d.strokes.len()), (-50.0, 1));
+    assert_eq!(d.field, expected(d));
+    control(&mut app, &json!({"undo": true})).unwrap();
+    let d = app.distort.liquify.as_ref().unwrap();
+    assert_eq!((d.faces[0].sliders.face_width, d.strokes.len()), (-50.0, 0));
+    assert_eq!(d.field, expected(d));
+    control(&mut app, &json!({"undo": true})).unwrap();
+    let d = app.distort.liquify.as_ref().unwrap();
+    assert_eq!((d.faces[0].sliders.face_width, d.strokes.len()), (0.0, 0));
+    assert!(d.field.is_identity());
+
+    // Redo brings them back in the same order.
+    control(&mut app, &json!({"redo": true})).unwrap();
+    assert_eq!(app.distort.liquify.as_ref().unwrap().faces[0].sliders.face_width, -50.0);
+    control(&mut app, &json!({"redo": true})).unwrap();
+    assert_eq!(app.distort.liquify.as_ref().unwrap().strokes.len(), 1);
+    control(&mut app, &json!({"redo": true})).unwrap();
+    let d = app.distort.liquify.as_ref().unwrap();
+    assert_eq!((d.faces[0].sliders.face_width, d.strokes.len()), (20.0, 1));
+    assert_eq!(d.field, expected(d));
+
+    // A new slider change after an undo clears Redo.
+    control(&mut app, &json!({"undo": true})).unwrap();
+    slide(&mut app, &[5.0]);
+    control(&mut app, &json!({"redo": true})).unwrap();
+    assert_eq!(app.distort.liquify.as_ref().unwrap().faces[0].sliders.face_width, 5.0);
+}

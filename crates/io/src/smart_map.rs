@@ -22,7 +22,8 @@
 //! Camera Raw and Displace keep their whole item as a template next to the editable settings
 //! (Displace's carries the embedded displacement map, see `displace_map.rs`); so does Perspective
 //! Warp (`perspective_warp_map.rs`), whose quads become the planes of its command. Hue/Saturation
-//! (`HStr`) maps to its adjustment command in `hue_sat_filter_map.rs`.
+//! (`HStr`) maps to its adjustment command in `hue_sat_filter_map.rs`. Liquify, which Photoshop
+//! stores in a form PhotoCraft doesn't read, is written as PhotoCraft's own item (`liquify_map.rs`).
 
 use photocraft_color::{BlendMode, ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{LayerMask, SmartFilter, SmartObject};
@@ -47,6 +48,8 @@ mod camera_raw;
 mod displace;
 #[path = "hue_sat_filter_map.rs"]
 mod hue_sat;
+#[path = "liquify_map.rs"]
+mod liquify;
 #[path = "perspective_warp_map.rs"]
 mod perspective_warp;
 #[path = "puppet_map.rs"]

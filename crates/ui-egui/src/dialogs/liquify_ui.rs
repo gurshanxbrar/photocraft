@@ -10,6 +10,7 @@
 
 use egui::{Align2, Color32, FontId, Pos2, Rect as ERect, Sense, Stroke, TextureHandle, pos2, vec2};
 use photocraft_algo::liquify::{LiquifyField, LiquifyStroke, LiquifyTool, MAX_LIVE_MS, ProxyImage, auto_cell};
+use photocraft_algo::liquify_face::{FaceEdit, FaceShape, FaceSliders};
 use photocraft_doc::{DocId, Document, LayerId};
 use photocraft_geom::Rect;
 use photocraft_raster::Surface;
@@ -277,6 +278,25 @@ pub struct LiquifyDialog {
     /// The document's selection when the dialog opened, which OK applies Liquify through: the
     /// preview mixes the same way (#9541). `None` without one.
     selection: Option<PreviewSelection>,
+    /// Face-Aware Liquify: the faces found in the layer, each with its sliders.
+    pub faces: Vec<FaceEdit>,
+    /// Select Face: the face the sliders edit.
+    pub face_sel: usize,
+    /// The eye sliders move both eyes together.
+    pub link_eyes: bool,
+    /// Show Face Overlay: the selected face's box and landmarks on the image.
+    pub show_face_overlay: bool,
+    /// The field of the strokes alone, kept while only face sliders change (cleared on any stroke).
+    stroke_field: Option<LiquifyField>,
+    /// Face slider undo steps: the faces before the change, and how many strokes there were
+    /// then. Undo takes back a face step when no stroke was added after it, else a stroke, so
+    /// slider and brush edits undo in the order they were made.
+    face_undo: Vec<(usize, Vec<FaceEdit>)>,
+    /// Undone face steps (the faces to put back, and the stroke count to redo them at).
+    face_redo: Vec<(usize, Vec<FaceEdit>)>,
+    /// The faces as they were when the slider change in progress began: a drag is one step,
+    /// recorded when the pointer is released.
+    face_change_from: Option<Vec<FaceEdit>>,
 }
 
 /// The selection a Liquify preview is shown through, as the engine applies it on OK
@@ -385,6 +405,7 @@ impl LiquifyDialog {
         // A stroke still open has already changed the field; record it so undo can replay it (#8055).
         self.end();
         self.redo.clear();
+        self.face_redo.clear();
         let tool = if alt { alt_tool(self.opts.tool) } else { self.opts.tool };
         let mut s = self.template(tool);
         s.points.push(p.to_vec());
@@ -416,7 +437,45 @@ impl LiquifyDialog {
     fn end(&mut self) {
         if let Some((s, _)) = self.cur.take() {
             self.strokes.push(s);
+            self.strokes_changed();
         }
+    }
+
+    /// Whether any face slider is off 0.
+    fn faces_active(&self) -> bool {
+        self.faces.iter().any(|f| !f.sliders.is_neutral())
+    }
+
+    /// The faces OK records: those with a slider off 0.
+    fn active_faces(&self) -> Vec<FaceEdit> {
+        self.faces.iter().filter(|f| !f.sliders.is_neutral()).copied().collect()
+    }
+
+    /// After a stroke was added: the cached stroke field is stale, and with face sliders set the
+    /// field is rebuilt so faces stay applied after the strokes, as OK replays them.
+    fn strokes_changed(&mut self) {
+        self.stroke_field = None;
+        if self.faces_active() {
+            self.rebuild();
+        }
+    }
+
+    /// A face slider moved: the stroke field (cached) plus every face's warps.
+    pub fn faces_changed(&mut self) {
+        let base = match self.stroke_field.take() {
+            Some(f) => f,
+            None => LiquifyField::from_strokes(self.canvas, self.cell, &self.strokes),
+        };
+        let mut field = base.clone();
+        for f in &self.faces {
+            field.apply_face(f);
+        }
+        self.stroke_field = Some(base);
+        self.field = field;
+        self.dirty = Some([0, 0, self.proxy.w, self.proxy.h]);
+        self.view_dirty = self.view_bounds;
+        self.mask_dirty = true;
+        self.render_dirty();
     }
 
     /// Closes the lasso polygon into the freeze mask, recorded like any stroke (so undo, replay
@@ -431,6 +490,7 @@ impl LiquifyDialog {
             pts.push(first);
         }
         self.redo.clear();
+        self.face_redo.clear();
         let mut s = self.template(LiquifyTool::LassoMask);
         s.amount = Some(if subtract { 0.0 } else { 1.0 });
         s.points = pts.into_iter().map(|p| p.to_vec()).collect();
@@ -438,22 +498,26 @@ impl LiquifyDialog {
         self.strokes.push(s);
         self.mark(d, true);
         self.render_dirty();
+        self.strokes_changed();
     }
 
     /// Applies a whole-field operation (Reconstruct…, mask buttons) as a stroke.
     fn global(&mut self, tool: LiquifyTool, amount: Option<f64>) {
         self.end();
         self.redo.clear();
+        self.face_redo.clear();
         let mut s = LiquifyStroke::new(tool, 1.0);
         s.amount = amount;
         let d = self.field.apply_stroke(&s);
         self.strokes.push(s);
         self.mark(d, true);
         self.render_dirty();
+        self.strokes_changed();
     }
 
     fn rebuild(&mut self) {
-        self.field = LiquifyField::from_strokes(self.canvas, self.cell, &self.strokes);
+        self.stroke_field = None;
+        self.field = photocraft_engine::distort_cmds::liquify_field(self.canvas, self.cell, &self.strokes, &self.faces);
         self.dirty = Some([0, 0, self.proxy.w, self.proxy.h]);
         // Undo rebuilds the whole field. The zoomed viewport is a separate buffer; leaving it
         // clean kept the pre-undo pixels on screen until the next zoom (#4100).
@@ -462,8 +526,38 @@ impl LiquifyDialog {
         self.render_dirty();
     }
 
+    /// Records the slider change in progress as one undo step (once the pointer is up).
+    pub fn finish_face_change(&mut self) {
+        if let Some(before) = self.face_change_from.take()
+            && before != self.faces
+        {
+            if self.face_undo.len() == REDO_STACK_LIMIT {
+                self.face_undo.remove(0);
+            }
+            self.face_undo.push((self.strokes.len(), before));
+            self.redo.clear();
+            self.face_redo.clear();
+        }
+    }
+
+    /// Puts `faces` back (undo or redo of a slider change).
+    fn set_faces(&mut self, faces: Vec<FaceEdit>) {
+        self.faces = faces;
+        self.face_sel = self.face_sel.min(self.faces.len().saturating_sub(1));
+        self.faces_changed();
+    }
+
     fn undo(&mut self) {
         self.end();
+        self.finish_face_change();
+        if self.face_undo.last().is_some_and(|(n, _)| *n == self.strokes.len())
+            && let Some((n, before)) = self.face_undo.pop()
+        {
+            let after = std::mem::replace(&mut self.faces, before.clone());
+            self.face_redo.push((n, after));
+            self.set_faces(before);
+            return;
+        }
         if let Some(stroke) = self.strokes.pop() {
             if self.redo.len() == REDO_STACK_LIMIT {
                 self.redo.remove(0);
@@ -475,11 +569,20 @@ impl LiquifyDialog {
 
     fn redo(&mut self) {
         self.end();
+        self.finish_face_change();
+        if self.face_redo.last().is_some_and(|(n, _)| *n == self.strokes.len())
+            && let Some((n, after)) = self.face_redo.pop()
+        {
+            self.face_undo.push((n, self.faces.clone()));
+            self.set_faces(after);
+            return;
+        }
         if let Some(stroke) = self.redo.pop() {
             let d = self.field.apply_stroke(&stroke);
             self.strokes.push(stroke);
             self.mark(d, true);
             self.render_dirty();
+            self.strokes_changed();
         }
     }
 
@@ -488,6 +591,7 @@ impl LiquifyDialog {
         self.lasso = None;
         self.strokes.clear();
         self.redo.clear();
+        self.face_redo.clear();
         self.rebuild();
     }
 
@@ -700,7 +804,7 @@ pub fn open(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(), String> 
     {
         surf = filtered;
     }
-    open_on(app, ctx, layer, surf, Vec::new(), auto_cell(canvas), None)
+    open_on(app, ctx, layer, surf, (Vec::new(), Vec::new()), auto_cell(canvas), None)
 }
 
 /// Re-opens Liquify smart filter `index` of smart object `layer` with its recorded strokes and
@@ -717,10 +821,11 @@ pub fn open_smart_filter(app: &mut PhotocraftApp, ctx: &egui::Context, layer: La
         return Err("the smart filter is not a Liquify filter".into());
     }
     let (strokes, cell) = liquify_params(LIQUIFY, &filter.params, st.doc.bounds()).map_err(|e| e.to_string())?;
+    let faces = photocraft_engine::distort_cmds::liquify_faces(LIQUIFY, &filter.params).map_err(|e| e.to_string())?;
     let surf = photocraft_engine::smart_cmds::render_below_filter(&st.doc, sm, index)
         .map_err(|e| e.to_string())?
         .ok_or("the smart object's contents are unavailable (missing linked file?)")?;
-    open_on(app, ctx, layer, surf, strokes, cell, Some(index))
+    open_on(app, ctx, layer, surf, (strokes, faces), cell, Some(index))
 }
 
 fn open_on(
@@ -728,7 +833,7 @@ fn open_on(
     ctx: &egui::Context,
     layer: LayerId,
     surf: Surface,
-    strokes: Vec<LiquifyStroke>,
+    (strokes, saved_faces): (Vec<LiquifyStroke>, Vec<FaceEdit>),
     cell: f64,
     smart_filter: Option<usize>,
 ) -> Result<(), String> {
@@ -763,6 +868,14 @@ fn open_on(
         canvas,
         cell,
         field: LiquifyField::from_strokes(canvas, cell, &strokes),
+        faces: Vec::new(),
+        face_sel: 0,
+        link_eyes: true,
+        show_face_overlay: true,
+        stroke_field: None,
+        face_undo: Vec::new(),
+        face_redo: Vec::new(),
+        face_change_from: None,
         strokes,
         redo: Vec::new(),
         cur: None,
@@ -808,9 +921,58 @@ fn open_on(
     }
     // Layer ids belong to one document: a remembered backdrop Use starts at All Layers.
     d.opts.backdrop_layer = None;
+    // Face-Aware Liquify: the faces in the layer being liquified, with any sliders saved in the
+    // smart filter put back on the face they were set on.
+    d.faces = detect_faces(&d.source, canvas);
+    merge_saved_faces(&mut d.faces, saved_faces);
+    if d.faces_active() {
+        d.rebuild();
+    }
     d.upload(ctx);
     app.distort.liquify = Some(d);
     Ok(())
+}
+
+/// The faces in `surf` (over `canvas`), best first, with neutral sliders. None when the image is
+/// too large to scan or this build can't detect faces.
+fn detect_faces(surf: &Surface, canvas: Rect) -> Vec<FaceEdit> {
+    use photocraft_engine::face_cmds;
+    // The scan holds the canvas as RGBA f32 (16 bytes a pixel): past 64 MP it is skipped.
+    let (w, h) = (canvas.width() as usize, canvas.height() as usize);
+    if w == 0 || h == 0 || w.saturating_mul(h) > 64 << 20 {
+        return Vec::new();
+    }
+    let mut px = vec![[0.0f32; 4]; w * h];
+    surf.read_rgba_into(canvas, &mut px);
+    let found = face_cmds::detect(&px, w, h, face_cmds::MIN_SCORE).unwrap_or_default();
+    let (x0, y0) = (f64::from(canvas.x0), f64::from(canvas.y0));
+    found
+        .into_iter()
+        .map(|f| FaceEdit {
+            face: FaceShape {
+                rect: [f64::from(f.rect[0]) + x0, f64::from(f.rect[1]) + y0, f64::from(f.rect[2]), f64::from(f.rect[3])],
+                landmarks: f.landmarks.map(|[x, y]| [f64::from(x) + x0, f64::from(y) + y0]),
+            },
+            sliders: FaceSliders::default(),
+        })
+        .collect()
+}
+
+/// Puts each saved face's sliders on the detected face nearest it (its geometry kept, so the
+/// result matches what was saved); a saved face with no detected face near it is added as it is.
+fn merge_saved_faces(faces: &mut Vec<FaceEdit>, saved: Vec<FaceEdit>) {
+    let centre = |f: &FaceEdit| [f.face.rect[0] + f.face.rect[2] / 2.0, f.face.rect[1] + f.face.rect[3] / 2.0];
+    for s in saved {
+        let c = centre(&s);
+        let near = faces.iter().position(|f| {
+            let d = centre(f);
+            (d[0] - c[0]).hypot(d[1] - c[1]) < s.face.rect[2].max(s.face.rect[3]) * 0.5
+        });
+        match near {
+            Some(i) => faces[i] = s,
+            None => faces.push(s),
+        }
+    }
 }
 
 /// Keeps the brush settings for the next time Liquify opens, also after a restart.
@@ -836,13 +998,22 @@ pub fn commit(app: &mut PhotocraftApp) -> Result<(), String> {
     remember(app, &d.opts);
     d.end();
     if let Some(index) = d.smart_filter {
-        let params = json!({"strokes": d.strokes, "meshSize": d.cell});
+        let mut params = json!({"strokes": d.strokes, "meshSize": d.cell});
+        let faces = d.active_faces();
+        if !faces.is_empty() {
+            params["faces"] = json!(faces);
+        }
         return app.run("layer.smartFilter.setParams", json!({"layer": d.layer.0, "index": index, "params": params})).map(|_| ());
     }
-    if d.strokes.is_empty() {
+    let faces = d.active_faces();
+    if d.strokes.is_empty() && faces.is_empty() {
         return Ok(());
     }
-    let p = crate::distort_ui::with_filter_target(json!({"strokes": d.strokes, "meshSize": d.cell, "layer": d.layer.0}), &d.target);
+    let mut p = json!({"strokes": d.strokes, "meshSize": d.cell, "layer": d.layer.0});
+    if !faces.is_empty() {
+        p["faces"] = json!(faces);
+    }
+    let p = crate::distort_ui::with_filter_target(p, &d.target);
     app.run("filter.liquify", p).map(|_| ())
 }
 
@@ -1277,6 +1448,8 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             widgets::slider_row(ui, tl!("Pressure"), &mut d.opts.pressure, 0.0..=100.0, "", None);
             widgets::slider_row(ui, tl!("Rate"), &mut d.opts.rate, 0.0..=100.0, "", None);
             widgets::hairline(ui);
+            face_aware_section(ui, d);
+            widgets::hairline(ui);
             widgets::section_label(ui, tl!("Brush Reconstruct Options"));
             widgets::slider_row(ui, tl!("Amount"), &mut d.opts.reconstruct_amount, 0.0..=100.0, "%", None);
             ui.horizontal(|ui| {
@@ -1315,6 +1488,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     110.0,
                 );
             });
+            widgets::checkbox(ui, &mut d.show_face_overlay, tl!("Show Face Overlay"));
             widgets::checkbox(ui, &mut d.opts.show_mask, tl!("Show Mask"));
             widgets::checkbox(ui, &mut d.opts.show_backdrop, tl!("Show Backdrop"));
             if d.opts.show_backdrop {
@@ -1422,6 +1596,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             );
             clip.image(m.id(), mr, uv, Color32::WHITE);
         }
+        draw_face_overlay(d, &clip, area);
         if d.opts.show_mesh {
             draw_mesh(d, &clip, area);
         }
@@ -1560,6 +1735,116 @@ fn to_doc(d: &LiquifyDialog, area: ERect, p: Pos2) -> [f64; 2] {
 /// position `p + d(p)`, so a source line `x = c` is the iso-line of that function, traced with
 /// marching squares on a sample grid four times finer than the mesh (exact for any field, unlike
 /// inverting the field point by point, which fails where it folds).
+/// One face slider row (`-100..=100`); true when it moved.
+fn face_slider(ui: &mut egui::Ui, label: &str, v: &mut f64) -> bool {
+    let mut x = *v as f32;
+    widgets::slider_row(ui, label, &mut x, -100.0..=100.0, "", None);
+    let x = f64::from(x.round());
+    let moved = x != *v;
+    *v = x;
+    moved
+}
+
+/// An eye slider: one row for both eyes when they are linked, else Left and Right rows (the
+/// image's left and right).
+fn eye_slider(ui: &mut egui::Ui, label: &str, pair: &mut [f64; 2], linked: bool) -> bool {
+    if linked {
+        let mut v = pair[0];
+        let moved = face_slider(ui, label, &mut v);
+        if moved {
+            *pair = [v, v];
+        }
+        moved
+    } else {
+        let a = face_slider(ui, &format!("{label} ({})", tl!("Left")), &mut pair[0]);
+        let b = face_slider(ui, &format!("{label} ({})", tl!("Right")), &mut pair[1]);
+        a || b
+    }
+}
+
+/// Properties › Face-Aware Liquify: Select Face, Reset / All, and the Eyes, Nose, Mouth and
+/// Face Shape sliders of the selected face.
+fn face_aware_section(ui: &mut egui::Ui, d: &mut LiquifyDialog) {
+    widgets::section_label(ui, tl!("Face-Aware Liquify"));
+    if d.faces.is_empty() {
+        ui.label(egui::RichText::new(tl!("No faces found in this layer.")).small());
+        return;
+    }
+    d.face_sel = d.face_sel.min(d.faces.len() - 1);
+    let before = d.faces.clone();
+    let mut changed = false;
+    // Two rows: on one, the label, the menu and both buttons are wider than the panel, which
+    // pushed every slider below past its right edge.
+    ui.horizontal(|ui| {
+        ui.label(tl!("Select Face"));
+        let names: Vec<String> = (1..=d.faces.len()).map(|i| format!("{} #{i}", tl!("Face"))).collect();
+        let opts: Vec<(usize, &str)> = names.iter().enumerate().map(|(i, n)| (i, n.as_str())).collect();
+        widgets::dropdown_literal(ui, "liquify-select-face", tl!("Select Face"), &mut d.face_sel, &opts, 100.0);
+    });
+    ui.horizontal(|ui| {
+        if widgets::secondary_button(ui, tl!("Reset"), 60.0).clicked() {
+            d.faces[d.face_sel].sliders = FaceSliders::default();
+            changed = true;
+        }
+        if widgets::secondary_button(ui, tl!("All"), 60.0).clicked() {
+            d.faces.iter_mut().for_each(|f| f.sliders = FaceSliders::default());
+            changed = true;
+        }
+    });
+    let link = &mut d.link_eyes;
+    let s = &mut d.faces[d.face_sel].sliders;
+    widgets::section_label(ui, tl!("Eyes"));
+    widgets::checkbox(ui, link, tl!("Link Eyes"));
+    let linked = *link;
+    changed |= eye_slider(ui, tl!("Eye Size"), &mut s.eye_size, linked);
+    changed |= eye_slider(ui, tl!("Eye Height"), &mut s.eye_height, linked);
+    changed |= eye_slider(ui, tl!("Eye Width"), &mut s.eye_width, linked);
+    changed |= eye_slider(ui, tl!("Eye Tilt"), &mut s.eye_tilt, linked);
+    changed |= face_slider(ui, tl!("Eye Distance"), &mut s.eye_distance);
+    widgets::section_label(ui, tl!("Nose"));
+    changed |= face_slider(ui, tl!("Nose Height"), &mut s.nose_height);
+    changed |= face_slider(ui, tl!("Nose Width"), &mut s.nose_width);
+    widgets::section_label(ui, tl!("Mouth"));
+    changed |= face_slider(ui, tl!("Smile"), &mut s.smile);
+    changed |= face_slider(ui, tl!("Upper Lip"), &mut s.upper_lip);
+    changed |= face_slider(ui, tl!("Lower Lip"), &mut s.lower_lip);
+    changed |= face_slider(ui, tl!("Mouth Width"), &mut s.mouth_width);
+    changed |= face_slider(ui, tl!("Mouth Height"), &mut s.mouth_height);
+    widgets::section_label(ui, tl!("Face Shape"));
+    changed |= face_slider(ui, tl!("Forehead"), &mut s.forehead);
+    changed |= face_slider(ui, tl!("Chin Height"), &mut s.chin_height);
+    changed |= face_slider(ui, tl!("Jawline"), &mut s.jawline);
+    changed |= face_slider(ui, tl!("Face Width"), &mut s.face_width);
+    if changed {
+        d.face_change_from.get_or_insert(before);
+        d.faces_changed();
+    }
+    // A drag (or a typed value) is one undo step, recorded once the pointer is up.
+    if !ui.input(|i| i.pointer.any_down()) {
+        d.finish_face_change();
+    }
+}
+
+/// Show Face Overlay: the selected face's box (dashed in the others' colour) and its landmarks,
+/// where they are after the warp.
+fn draw_face_overlay(d: &LiquifyDialog, painter: &egui::Painter, area: ERect) {
+    if !d.show_face_overlay {
+        return;
+    }
+    for (i, f) in d.faces.iter().enumerate() {
+        let sel = i == d.face_sel;
+        let colour = if sel { Color32::from_rgb(80, 170, 255) } else { Color32::from_rgba_unmultiplied(200, 200, 200, 140) };
+        let [x, y, w, h] = f.face.rect;
+        let corners = [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]].map(|p| to_screen(d, area, p));
+        painter.add(egui::Shape::line(corners.to_vec(), Stroke::new(if sel { 1.5 } else { 1.0 }, colour)));
+        if sel {
+            for p in f.face.landmarks {
+                painter.circle_stroke(to_screen(d, area, p), 3.0, Stroke::new(1.5, colour));
+            }
+        }
+    }
+}
+
 fn draw_mesh(d: &LiquifyDialog, painter: &egui::Painter, area: ERect) {
     let c = d.canvas;
     let cells = [64.0, 40.0, 24.0][d.opts.mesh_size.min(2)];

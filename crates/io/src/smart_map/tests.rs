@@ -2313,3 +2313,42 @@ fn render_filters_made_in_photocraft_are_written() {
     assert!(item_for_filter(&sf("filter.render.lensFlare", json!({"lens": "fisheye"}))).unwrap_err().contains("fisheye"));
     assert!(item_for_filter(&sf("filter.render.clouds", json!({"foreground": "red"}))).is_err());
 }
+
+/// A Liquify smart filter has no Photoshop-readable form, so it is written as PhotoCraft's own
+/// filter item with its strokes as data; saving to PSD and reopening keeps it, unchanged.
+#[test]
+fn liquify_round_trips_through_psd() {
+    let params = json!({
+        "strokes": [
+            {"tool": "forwardWarp", "size": 120.0, "density": 50.0, "pressure": 100.0, "rate": 80.0,
+             "points": [[100.0, 200.0], [130.5, 210.25], [160.0, 215.0]]},
+            {"tool": "bloat", "size": 40.0, "points": [[300.0, 300.0]]}
+        ],
+        "meshSize": 4.0
+    });
+    let f = SmartFilter { command: "filter.liquify".into(), params: params.clone(), blend: BlendMode::Multiply, opacity: 0.5, visible: false };
+    let stack = FilterStack { enabled: true, mask_enabled: false, mask_linked: true, filters: vec![f.clone()] };
+    let mut warnings = Vec::new();
+    let fx = filter_fx(&stack, "Layer 0", &mut warnings);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let Some(Value::List(list)) = fx.get("filterFXList") else { panic!("no filterFXList") };
+    assert_eq!(list.len(), 1);
+    let Value::Descriptor(item) = &list[0] else { panic!("not a descriptor") };
+    let back = filter_from_item(&Descriptor::from_bytes(&item.to_bytes()).unwrap());
+    assert_eq!(back, f);
+}
+
+/// Damaged Liquify data stays an opaque filter (kept and written back), never a crash or a guess.
+#[test]
+fn unreadable_liquify_data_stays_unsupported() {
+    let f = sf("filter.liquify", json!({"strokes": []}));
+    let mut item = item_for_filter(&f).unwrap();
+    let Some((_, Value::Descriptor(fltr))) = item.items.iter_mut().find(|(k, _)| k.is("Fltr")) else { panic!("no Fltr") };
+    for (k, v) in &mut fltr.items {
+        if k.is("params") {
+            *v = Value::RawData(b"{not json".to_vec());
+        }
+    }
+    let back = filter_from_item(&Descriptor::from_bytes(&item.to_bytes()).unwrap());
+    assert_eq!(back.command, UNSUPPORTED_FILTER);
+}

@@ -6,7 +6,7 @@ use super::import::{
 };
 use super::placed::enumv;
 use super::{
-    Class, Descriptor, FilterStack, Id, J, ReferenceItem, SmartFilter, UNSUPPORTED_FILTER, UnicodeString, Value, camera_raw, displace, hue_sat,
+    Class, Descriptor, FilterStack, Id, J, ReferenceItem, SmartFilter, UNSUPPORTED_FILTER, UnicodeString, Value, camera_raw, displace, hue_sat, liquify,
     perspective_warp, puppet,
 };
 
@@ -305,6 +305,9 @@ pub fn item_for_filter(f: &SmartFilter) -> Result<Descriptor, String> {
     }
     if f.command == hue_sat::COMMAND {
         return hue_sat::export_item(f);
+    }
+    if f.command == liquify::COMMAND {
+        return liquify::export_item(f);
     }
     if perspective_warp::handles(&f.command) {
         return perspective_warp::export_item(f);

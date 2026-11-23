@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 
 use photocraft_algo::liquify::{LiquifyField, LiquifyStroke, apply_liquify, auto_cell};
+use photocraft_algo::liquify_face::FaceEdit;
 use photocraft_algo::perspective::{PerspectiveMap, Plane, Straighten, straighten};
 use photocraft_algo::puppet::{PuppetDensity, PuppetMesh, PuppetMode, PuppetPin, PuppetWarp, puppet_warp, puppet_warp_with_mask, warp_with_mesh};
 use photocraft_algo::transform::Interp;
@@ -59,6 +60,33 @@ pub fn liquify_params(cmd: &str, p: &Value, canvas: Rect) -> Result<(Vec<Liquify
         }
     };
     Ok((strokes, cell))
+}
+
+/// Face-Aware Liquify params: one entry per face, with its geometry and sliders (`faces`).
+pub fn liquify_faces(cmd: &str, p: &Value) -> Result<Vec<FaceEdit>> {
+    let faces: Vec<FaceEdit> = match p.get("faces") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| bad(cmd, format!("bad `faces`: {e}")))?,
+    };
+    if faces.len() > MAX_LIQUIFY_FACES {
+        return Err(bad(cmd, format!("at most {MAX_LIQUIFY_FACES} faces")));
+    }
+    for f in &faces {
+        f.validate().map_err(|e| bad(cmd, e))?;
+    }
+    Ok(faces)
+}
+
+/// Most faces one Liquify edits (the dialog lists those detected; a file can't ask for more).
+pub const MAX_LIQUIFY_FACES: usize = 64;
+
+/// The Liquify field for strokes and face sliders: the strokes replay first, then each face.
+pub fn liquify_field(canvas: Rect, cell: f64, strokes: &[LiquifyStroke], faces: &[FaceEdit]) -> LiquifyField {
+    let mut field = LiquifyField::from_strokes(canvas, cell, strokes);
+    for f in faces {
+        field.apply_face(f);
+    }
+    field
 }
 
 /// Puppet Warp params.
@@ -203,8 +231,8 @@ fn mix_by_selection(old: &Surface, new: &Surface, sel: &Surface) -> Result<Surfa
 }
 
 /// Liquifies a surface over `canvas` (the field's extent).
-pub fn liquify_surface(surf: &Surface, strokes: &[LiquifyStroke], cell: f64, canvas: Rect) -> Surface {
-    let field = LiquifyField::from_strokes(canvas, cell, strokes);
+pub fn liquify_surface(surf: &Surface, strokes: &[LiquifyStroke], faces: &[FaceEdit], cell: f64, canvas: Rect) -> Surface {
+    let field = liquify_field(canvas, cell, strokes, faces);
     apply_liquify(surf, &field)
 }
 
@@ -234,7 +262,8 @@ pub fn apply_to_surface(id: &str, params: &Value, surf: &Surface, canvas: Rect) 
     match id {
         LIQUIFY => {
             let (strokes, cell) = liquify_params(id, params, canvas).ok()?;
-            Some(liquify_surface(surf, &strokes, cell, canvas))
+            let faces = liquify_faces(id, params).ok()?;
+            Some(liquify_surface(surf, &strokes, &faces, cell, canvas))
         }
         // A stored warp too far to render leaves the smart object as it is (#1019).
         PUPPET | PUPPET_SMART => {
@@ -335,12 +364,13 @@ fn run_on_layer(s: &mut Session, cmd: &str, label: &str, p: &Value, moves: bool,
 fn liquify(s: &mut Session, p: &Value) -> Result<Value> {
     let canvas = s.active().ok_or(EngineError::NoDocument)?.doc.bounds();
     let (strokes, cell) = liquify_params(LIQUIFY, p, canvas)?;
+    let faces = liquify_faces(LIQUIFY, p)?;
     let id = target(s, p)?;
-    if strokes.is_empty() {
+    if strokes.is_empty() && faces.iter().all(|f| f.sliders.is_neutral()) {
         return Ok(json!({"layer": id.0, "changed": false}));
     }
     let t0 = Stopwatch::start();
-    let field = LiquifyField::from_strokes(canvas, cell, &strokes);
+    let field = liquify_field(canvas, cell, &strokes, &faces);
     let smart = matches!(s.active().and_then(|d| d.doc.layer(id)).map(|l| &l.content), Some(LayerContent::Smart(_)));
     if field.is_identity() && !smart {
         return Ok(json!({"layer": id.0, "changed": false}));
@@ -445,7 +475,7 @@ fn perspective(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    const L: &str = r##"{"strokes":[{"tool":"forwardWarp|reconstruct|smooth|twirlCw|twirlCcw|pucker|bloat|pushLeft|freeze|thaw|lassoMask|reconstructAll","size":px=100,"density":0-100=50,"pressure":0-100=100,"rate":0-100=80,"points":[[x,y,pressure?,ms?]…] (ms: milliseconds since the previous point; a point with it follows the pointer exactly and times the stationary tools in real time, as the dialog records them),"amount":%? (twirlCcw: twirlCw reversed, what an Alt-drag with Twirl Clockwise records; reconstructAll; lassoMask: 1 freezes the polygon in points, 0 thaws it)}…],"meshSize":px? (field resolution, px per node; default 2, or 4 above 4 MP),"layer":id?} — strokes replay in order on a fresh field; a selection limits the effect; on a smart object it becomes a smart filter"##;
+    const L: &str = r##"{"strokes":[{"tool":"forwardWarp|reconstruct|smooth|twirlCw|twirlCcw|pucker|bloat|pushLeft|freeze|thaw|lassoMask|reconstructAll","size":px=100,"density":0-100=50,"pressure":0-100=100,"rate":0-100=80,"points":[[x,y,pressure?,ms?]…] (ms: milliseconds since the previous point; a point with it follows the pointer exactly and times the stationary tools in real time, as the dialog records them),"amount":%? (twirlCcw: twirlCw reversed, what an Alt-drag with Twirl Clockwise records; reconstructAll; lassoMask: 1 freezes the polygon in points, 0 thaws it)}…],"faces":[{"rect":[x,y,w,h],"landmarks":[[x,y]×5] (eyes left/right, nose tip, mouth corners right/left, as image.detectFaces reports),"eyeSize":[l,r],"eyeHeight":[l,r],"eyeWidth":[l,r],"eyeTilt":[l,r],"eyeDistance","noseHeight","noseWidth","smile","upperLip","lowerLip","mouthWidth","mouthHeight","forehead","chinHeight","jawline","faceWidth" (each -100..100, default 0)}…]? (Face-Aware Liquify, applied after the strokes),"meshSize":px? (field resolution, px per node; default 2, or 4 above 4 MP),"layer":id?} — strokes replay in order on a fresh field; a selection limits the effect; on a smart object it becomes a smart filter"##;
     const P: &str = r##"{"pins":[{"src":[x,y],"dst":[x,y],"rotate":deg?,"depth":n?}…],"mode":"rigid|normal|distort"="normal","density":"fewer|normal|more"="normal","expansion":px=2,"interpolation":"bicubic|bilinear|nearest","layer":id?} — mesh over the opaque region, as-rigid-as-possible; on a smart object it becomes a smart filter"##;
     const Q: &str = r##"{"planes":[{"src":[[x,y]×4],"dst":[[x,y]×4]}…] (corners clockwise from top-left; corners that coincide in src are linked),"straighten":"horizontal|vertical|auto"?,"interpolation":"bicubic|bilinear|nearest","layer":id?}"##;
     vec![
